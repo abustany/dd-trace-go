@@ -350,19 +350,15 @@ func TestSpanModifyWhileFlushing(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		fmt.Println("span start")
 		span := tracer.newRootSpan("pylons.request", "pylons", "/")
 		span.Finish()
-		fmt.Println("span finished")
 		// It doesn't make much sense to update the span after it's been finished,
 		// but an error in a user's code could lead to this.
 		span.SetTag("race_test", "true")
 		span.SetTag("race_test2", 133.7)
 		span.SetTag("race_test3", 133.7)
 		span.SetTag(ext.Error, errors.New("t"))
-		fmt.Println("DONE")
 		done <- struct{}{}
-		fmt.Println("DONE finished")
 	}()
 
 	for {
@@ -370,9 +366,7 @@ func TestSpanModifyWhileFlushing(t *testing.T) {
 		case <-done:
 			return
 		default:
-			fmt.Println("FORCE FLUSH")
 			tracer.forceFlush()
-			fmt.Println("FORCE FLUSH FINISHED")
 		}
 	}
 }
