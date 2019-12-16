@@ -45,6 +45,10 @@ type payload struct {
 
 	// closed specifies the notification channel for each Close call.
 	closed chan struct{}
+
+	// confirm is a channel used to signal a payload has been sucessfully flushed.
+	// This is only used for testing purposes.
+	confirm chan<- struct{}
 }
 
 var _ io.Reader = (*payload)(nil)

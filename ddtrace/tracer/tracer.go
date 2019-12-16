@@ -43,6 +43,9 @@ type tracer struct {
 	// payloadChan receives traces to be added to the payload.
 	payloadChan chan []*span
 
+	// sendChan receives payloads to be sent to the agent
+	sendChan chan *payload
+
 	// stopped is a channel that will be closed when the worker has exited.
 	stopped chan struct{}
 
@@ -66,6 +69,8 @@ type tracer struct {
 	// These integers track metrics about spans and traces as they are started,
 	// finished, and dropped
 	spansStarted, spansFinished, tracesDropped int64
+
+	payloads sync.Pool
 }
 
 const (
@@ -127,8 +132,19 @@ func Inject(ctx ddtrace.SpanContext, carrier interface{}) error {
 	return internal.GetGlobalTracer().Inject(ctx, carrier)
 }
 
+func newPool() sync.Pool {
+	return sync.Pool{
+		New: func() interface{} {
+			return newPayload()
+		},
+	}
+}
+
 // payloadQueueSize is the buffer size of the trace channel.
 const payloadQueueSize = 1000
+
+// sendQueueSize is the buffer size of the outgoing payload channel
+const sendQueueSize = 10
 
 func newTracer(opts ...StartOption) *tracer {
 	c := new(config)
@@ -164,9 +180,11 @@ func newTracer(opts ...StartOption) *tracer {
 		flushChan:        make(chan chan<- struct{}),
 		exitChan:         make(chan struct{}),
 		payloadChan:      make(chan []*span, payloadQueueSize),
+		sendChan:         make(chan *payload, sendQueueSize),
 		stopped:          make(chan struct{}),
 		prioritySampling: newPrioritySampler(),
 		pid:              strconv.Itoa(os.Getpid()),
+		payloads:         newPool(),
 	}
 	t.config.statsd.Incr("datadog.tracer.started", nil, 1)
 	if c.runtimeMetrics {
@@ -188,6 +206,12 @@ func newTracer(opts ...StartOption) *tracer {
 		defer t.wg.Done()
 		t.reportHealthMetrics(statsInterval)
 	}()
+
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		t.flusher()
+	}()
 	return t
 }
 
@@ -205,14 +229,11 @@ func (t *tracer) worker() {
 
 		case <-ticker.C:
 			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:scheduled"}, 1)
-			t.flushPayload()
+			t.flushPayload(nil)
 
 		case confirm := <-t.flushChan:
 			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:size"}, 1)
-			t.flushPayload()
-			if confirm != nil {
-				confirm <- struct{}{}
-			}
+			t.flushPayload(confirm)
 
 		case <-t.exitChan:
 		loop:
@@ -227,7 +248,7 @@ func (t *tracer) worker() {
 				}
 			}
 			t.config.statsd.Incr("datadog.tracer.flush_triggered", []string{"reason:shutdown"}, 1)
-			t.flushPayload()
+			t.flushPayload(nil)
 			t.config.statsd.Incr("datadog.tracer.stopped", nil, 1)
 			return
 		}
@@ -351,16 +372,29 @@ func (t *tracer) Extract(carrier interface{}) (ddtrace.SpanContext, error) {
 }
 
 // flush will push any currently buffered traces to the server.
-func (t *tracer) flushPayload() {
+func (t *tracer) flushPayload(confirm chan<- struct{}) {
 	if t.payload.itemCount() == 0 {
+		if confirm != nil {
+			confirm <- struct{}{}
+		}
 		return
 	}
+	pl := t.payload
+	t.payload = t.payloads.Get().(*payload)
+	pl.confirm = confirm
+	t.sendChan <- pl
+}
+
+func (t *tracer) sendPayload(p *payload) {
 	defer func(start time.Time) {
 		t.config.statsd.Timing("datadog.tracer.flush_duration", time.Since(start), nil, 1)
 	}(time.Now())
-	size, count := t.payload.size(), t.payload.itemCount()
+	if p.confirm != nil {
+		defer func() { p.confirm <- struct{}{} }()
+	}
+	size, count := p.size(), p.itemCount()
 	log.Debug("Sending payload: size: %d traces: %d\n", size, count)
-	rc, err := t.config.transport.send(t.payload)
+	rc, err := t.config.transport.send(p)
 	if err != nil {
 		t.config.statsd.Count("datadog.tracer.traces_dropped", int64(count), []string{"reason:send_failed"}, 1)
 		log.Error("lost %d traces: %v", count, err)
@@ -371,7 +405,19 @@ func (t *tracer) flushPayload() {
 			t.config.statsd.Incr("datadog.tracer.decode_error", nil, 1)
 		}
 	}
-	t.payload.reset()
+	p.reset()
+	t.payloads.Put(p)
+}
+
+func (t *tracer) flusher() {
+	for {
+		select {
+		case p := <-t.sendChan:
+			t.sendPayload(p)
+		case <-t.exitChan:
+			return
+		}
+	}
 }
 
 // pushPayload pushes the trace onto the payload. If the payload becomes

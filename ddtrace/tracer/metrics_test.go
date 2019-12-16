@@ -284,8 +284,10 @@ func TestReportHealthMetrics(t *testing.T) {
 		flushChan:        make(chan chan<- struct{}),
 		exitChan:         make(chan struct{}),
 		payloadChan:      make(chan []*span, payloadQueueSize),
+		sendChan:         make(chan *payload, payloadQueueSize),
 		stopped:          make(chan struct{}),
 		prioritySampling: newPrioritySampler(),
+		payloads:         newPool(),
 	}
 	internal.SetGlobalTracer(trc)
 	defer internal.SetGlobalTracer(&internal.NoopTracer{})
@@ -294,6 +296,11 @@ func TestReportHealthMetrics(t *testing.T) {
 	go func() {
 		defer trc.wg.Done()
 		trc.worker()
+	}()
+	trc.wg.Add(1)
+	go func() {
+		defer trc.wg.Done()
+		trc.flusher()
 	}()
 	trc.wg.Add(1)
 	go func() {
